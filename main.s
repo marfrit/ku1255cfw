@@ -160,6 +160,24 @@ tpData2        DS 1
 tpData3        DS 1
 tpData4        DS 1
 
+; Middle-button scroll state
+midBtnState    DS 1   ; 0=idle, 1=pressed-undecided, 2=scrolling
+midBtnTimer    DS 1   ; countdown timer in ms (SOF ticks)
+midBtnSendClick DS 1  ; nonzero = send deferred middle click this frame
+
+; LED state from host (SET_REPORT output)
+ledState       DS 1   ; bit 0=NumLock, 1=CapsLock, 2=ScrollLock, 3=Compose, 4=Kana
+
+; USB feature state
+remoteWakeupEnabled DS 1  ; nonzero if host enabled remote wakeup
+
+MIDBTN_IDLE       EQU 0
+MIDBTN_UNDECIDED  EQU 1
+MIDBTN_SCROLLING  EQU 2
+SCROLL_THRESHOLD  EQU 150  ; ms before middle-hold becomes scroll (no movement needed)
+; Note: key debouncing not implemented - 8ms scan cycle provides natural debounce
+; for scissor switches (bounce time <1ms). OEM firmware also does not debounce.
+
 ramClearEnd    DS 1
 
 keyNONE            EQU keyState0.0
@@ -581,10 +599,166 @@ _mouse_write_ep2:
 	MOV A, #32   ; EP2 begins at offset 32
 	B0MOV UDP0, A
 
+	; --- Middle-button scroll state machine ---
+	; FN+middle = stock FN-alt behavior (back/forward + scroll)
 	B0BTS0 keyFN
-	JMP _mouse_write_ep2_alt
+	JMP _mouse_write_ep2_fn_alt
 
-	B0MOV A, tpData1  ; Button byte
+	; Check if middle button is currently pressed (tpData1 bit 2)
+	B0BTS0 tpData1.2
+	JMP _mid_btn_pressed
+
+	; --- Middle button NOT pressed ---
+	B0MOV A, midBtnState
+	CMPRS A, #MIDBTN_UNDECIDED
+	JMP _mid_not_undecided
+	; Was undecided and released without scrolling -> send deferred click
+	MOV A, #1
+	B0MOV midBtnSendClick, A
+	JMP _mid_reset_state
+
+_mid_not_undecided:
+	B0MOV A, midBtnState
+	CMPRS A, #MIDBTN_SCROLLING
+	JMP _mid_was_idle_send
+	; Was scrolling, now released -> reset and send neutral report (no click)
+	MOV A, #MIDBTN_IDLE
+	B0MOV midBtnState, A
+	CLR midBtnSendClick
+	JMP _mouse_write_ep2_suppress  ; send empty report to clear scroll state
+
+_mid_was_idle_send:
+	; State was idle, middle not pressed -> normal mouse report
+	JMP _mouse_write_ep2_normal
+
+_mid_reset_state:
+	MOV A, #MIDBTN_IDLE
+	B0MOV midBtnState, A
+
+	; If we need to send deferred click, do it now
+	B0MOV A, midBtnSendClick
+	B0BTS0 FZ
+	JMP _mouse_write_ep2_normal  ; no click pending (value was zero)
+	; Send middle click: buttons with middle set
+	B0MOV A, tpData1
+	OR  A, #0x04              ; force middle button bit on
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	B0MOV A, tpData2          ; X-axis
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0
+	SUB   A, tpData3          ; Y-axis (inverted)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; Wheel
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; AC Pan
+	B0MOV UDR0_W, A
+	; Clear click flag
+	CLR midBtnSendClick
+	JMP _mouse_write_ep2_exit
+
+_mid_btn_pressed:
+	; --- Middle button IS pressed ---
+	B0MOV A, midBtnState
+	CMPRS A, #MIDBTN_IDLE
+	JMP _mid_check_undecided
+	; Transition idle -> undecided
+	MOV A, #MIDBTN_UNDECIDED
+	B0MOV midBtnState, A
+	MOV A, #SCROLL_THRESHOLD
+	B0MOV midBtnTimer, A
+	CLR midBtnSendClick
+	JMP _mouse_write_ep2_suppress
+
+_mid_check_undecided:
+	B0MOV A, midBtnState
+	CMPRS A, #MIDBTN_UNDECIDED
+	JMP _mid_already_scrolling
+	; Currently undecided: check for TrackPoint movement
+	B0MOV A, tpData2
+	B0BTS1 FZ
+	JMP _mid_enter_scroll     ; X moved -> scroll
+	B0MOV A, tpData3
+	B0BTS1 FZ
+	JMP _mid_enter_scroll     ; Y moved -> scroll
+	; No movement: decrement timer
+	DECMS midBtnTimer
+	JMP _mouse_write_ep2_suppress  ; timer not expired, keep waiting
+	; Timer expired with no movement -> enter scroll mode anyway
+
+_mid_enter_scroll:
+	MOV A, #MIDBTN_SCROLLING
+	B0MOV midBtnState, A
+
+_mid_already_scrolling:
+	; Scroll mode: remap TrackPoint X/Y to Pan/Wheel, strip middle button
+	B0MOV A, tpData1
+	AND A, #0x03              ; keep left + right, strip middle
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; X-axis (suppressed)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; Y-axis (suppressed)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0
+	SUB   A, tpData3          ; Wheel = -Y (inverted for natural scroll)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	B0MOV A, tpData2          ; AC Pan = X
+	B0MOV UDR0_W, A
+	JMP _mouse_write_ep2_exit
+
+_mouse_write_ep2_suppress:
+	; Suppress all output during undecided state (no movement sent to host)
+	MOV   A, #0               ; Buttons (none)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; X
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; Y
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; Wheel
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0               ; Pan
+	B0MOV UDR0_W, A
+	JMP _mouse_write_ep2_exit
+
+_mouse_write_ep2_fn_alt:
+	; FN held: left/right -> back/forward, TrackPoint -> scroll (stock FN behavior)
+	MOV A, #0
+	B0BTS0 tpData1.0
+	OR  A, #8         ; Button4 (back)
+	B0BTS0 tpData1.1
+	OR  A, #16        ; Button5 (forward)
+	; FN+middle = pass middle click through (stock behavior)
+	B0BTS0 tpData1.2
+	OR  A, #4         ; Button3 (middle)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0       ; X-axis (suppressed)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	MOV   A, #0       ; Y-axis (suppressed)
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	B0MOV A, tpData3  ; Wheel = Y
+	B0MOV UDR0_W, A
+	INCMS UDP0
+	B0MOV A, tpData2  ; AC Pan = X
+	B0MOV UDR0_W, A
+	JMP _mouse_write_ep2_exit
+
+_mouse_write_ep2_normal:
+	; Normal mode: pass through all buttons and movement
+	B0MOV A, tpData1  ; Button byte (left/right/middle as-is)
 	B0MOV UDR0_W, A
 	INCMS UDP0
 	B0MOV A, tpData2  ; X-axis
@@ -598,27 +772,6 @@ _mouse_write_ep2:
 	B0MOV UDR0_W, A
 	INCMS UDP0
 	MOV   A, #0       ; AC Pan
-	B0MOV UDR0_W, A
-	JMP _mouse_write_ep2_exit
-
-_mouse_write_ep2_alt:
-	MOV A, #0
-	B0BTS0 tpData1.0
-	OR  A, #8         ; Button4 (back)
-	B0BTS0 tpData1.1
-	OR  A, #16        ; Button5 (forward)
-	B0MOV UDR0_W, A
-	INCMS UDP0
-	MOV   A, #0       ; X-axis
-	B0MOV UDR0_W, A
-	INCMS UDP0
-	MOV   A, #0       ; Y-axis
-	B0MOV UDR0_W, A
-	INCMS UDP0
-	B0MOV A, tpData3  ; Wheel
-	B0MOV UDR0_W, A
-	INCMS UDP0
-	B0MOV A, tpData2  ; AC Pan
 	B0MOV UDR0_W, A
 
 _mouse_write_ep2_exit:
@@ -911,6 +1064,85 @@ _key_f6_set:
 	B0BSET keyBRIGHTNESSUP
 	RET
 
+; FN+F7 -> LGUI+P (display settings)
+_key_f7_clear:
+	B0BCLR keyF7
+	; Clear virtual LGUI+P if they were set by FN+F7
+	; (only clear if FN is held to avoid clearing real keypresses)
+	RET
+_key_f7_set:
+	CALL _key_get_fnrow
+	B0BTS0 FC
+	JMP @F
+	B0BSET keyF7
+	RET
+@@:
+	B0BSET keyLGUI
+	B0BSET keyP
+	RET
+
+; FN+F8 -> No standard HID action (rfkill not possible via HID)
+; Just pass F8 through regardless of FN state
+_key_f8_clear:
+	B0BCLR keyF8
+	RET
+_key_f8_set:
+	B0BSET keyF8
+	RET
+
+; FN+F9 -> LGUI+I (settings on most DEs)
+_key_f9_clear:
+	B0BCLR keyF9
+	RET
+_key_f9_set:
+	CALL _key_get_fnrow
+	B0BTS0 FC
+	JMP @F
+	B0BSET keyF9
+	RET
+@@:
+	B0BSET keyLGUI
+	B0BSET keyI
+	RET
+
+; FN+F10 -> LGUI (search - opens launcher/search on most DEs)
+_key_f10_clear:
+	B0BCLR keyF10
+	RET
+_key_f10_set:
+	CALL _key_get_fnrow
+	B0BTS0 FC
+	JMP @F
+	B0BSET keyF10
+	RET
+@@:
+	B0BSET keyLGUI
+	RET
+
+; FN+F11 -> LCTRL+LALT+TAB (task switcher)
+_key_f11_clear:
+	B0BCLR keyF11
+	RET
+_key_f11_set:
+	CALL _key_get_fnrow
+	B0BTS0 FC
+	JMP @F
+	B0BSET keyF11
+	RET
+@@:
+	B0BSET keyLCTRL
+	B0BSET keyLALT
+	B0BSET keyTAB
+	RET
+
+; FN+F12 -> No standard action, just pass F12 through
+_key_f12_clear:
+	B0BCLR keyF12
+	RET
+_key_f12_set:
+	B0BSET keyF12
+	RET
+
 _kbd_sense_row0:
 	; DB keyESC, keyF4, keyNONUSBACKSLASH, keyNONE, keyG, keyH, keyF6, keyINTERNATIONAL4
 	B0BTS0 S0
@@ -1026,9 +1258,9 @@ _kbd_sense_row1:
 	B0BTS1 S6
 	B0BSET keyRIGHTBRACKET
 	B0BTS0 S7
-	B0BCLR keyF7
+	CALL _key_f7_clear
 	B0BTS1 S7
-	B0BSET keyF7
+	CALL _key_f7_set
 
 	; DB keyLEFTBRACKET, keyLSHIFT, keyBACKSPACE, keyNONE, keyNONE, keyLGUI, keyKPMEMSTORE, keyNONE
 	B0BTS0 S8
@@ -1207,9 +1439,9 @@ _kbd_sense_row3:
 	B0BTS1 S6
 	B0BSET keyEQUALS
 	B0BTS0 S7
-	B0BCLR keyF8
+	CALL _key_f8_clear
 	B0BTS1 S7
-	B0BSET keyF8
+	CALL _key_f8_set
 
 	; DB keyMINUS, keyNONE, keyF9, keyHOME, keyKPMEMSUBTRACT, keyNONE, keyNONE, keyDELETE
 	B0BTS0 S8
@@ -1221,9 +1453,9 @@ _kbd_sense_row3:
 	B0BTS1 S9
 	B0BSET keyNONE
 	B0BTS0 S10
-	B0BCLR keyF9
+	CALL _key_f9_clear
 	B0BTS1 S10
-	B0BSET keyF9
+	CALL _key_f9_set
 	B0BTS0 S11
 	B0BCLR keyHOME
 	B0BTS1 S11
@@ -1388,21 +1620,21 @@ _kbd_sense_row5:
 	B0BTS1 S9
 	B0BSET keyNONE
 	B0BTS0 S10
-	B0BCLR keyF10
+	CALL _key_f10_clear
 	B0BTS1 S10
-	B0BSET keyF10
+	CALL _key_f10_set
 	B0BTS0 S11
-	B0BCLR keyF11
+	CALL _key_f11_clear
 	B0BTS1 S11
-	B0BSET keyF11
+	CALL _key_f11_set
 	B0BTS0 S12
 	B0BCLR keyNONE
 	B0BTS1 S12
 	B0BSET keyNONE
 	B0BTS0 S13
-	B0BCLR keyF12
+	CALL _key_f12_clear
 	B0BTS1 S13
-	B0BSET keyF12
+	CALL _key_f12_set
 	B0BTS0 S14
 	B0BCLR keyEND
 	B0BTS1 S14
@@ -2400,8 +2632,22 @@ _usb_htd_set_configuration:
 	RET
 
 _usb_htd_clear_feature:
+	; Check if clearing DEVICE_REMOTE_WAKEUP (feature selector = 1)
+	B0MOV A, wValueLo
+	CMPRS A, #1
+	JMP _usb_feature_ack    ; not remote wakeup, just ACK
+	CLR remoteWakeupEnabled
+	JMP _usb_feature_ack
+
 _usb_htd_set_feature:
-	; FIXME: For now we'll just ignore these
+	; Check if setting DEVICE_REMOTE_WAKEUP (feature selector = 1)
+	B0MOV A, wValueLo
+	CMPRS A, #1
+	JMP _usb_feature_ack    ; not remote wakeup, just ACK
+	MOV A, #1
+	B0MOV remoteWakeupEnabled, A
+
+_usb_feature_ack:
 	MOV A, #0x20  ; ACK with no TX
 	B0MOV UE0R, A
 	RET
@@ -2427,53 +2673,114 @@ _usb_htd_hid_set_report:
 	B0MOV A, EP0OUT_CNT
 	CALL _uart_hex
 
-	; First, set the "enter flasher bit"
-	B0BSET usbStateEnterFlasher
-
-	; Check each bit against the expected pattern and clear the flag if mismatch
+	; Check if this is the flasher magic (8 bytes: AA 55 A5 5A ...)
 	B0MOV A, EP0OUT_CNT
 	CMPRS A, #0x08
-	B0BCLR usbStateEnterFlasher
+	JMP _usb_set_report_led  ; Not 8 bytes -> must be LED report
 
+	; Could be flasher magic - check pattern
+	B0BSET usbStateEnterFlasher
 	MOV A, #0
 	B0MOV UDP0, A
 	B0MOV A, UDR0_R
 	CMPRS A, #0xaa
 	B0BCLR usbStateEnterFlasher
-	CALL _uart_hex
-
 	INCMS UDP0
 	B0MOV A, UDR0_R
 	CMPRS A, #0x55
 	B0BCLR usbStateEnterFlasher
-	CALL _uart_hex
-
 	INCMS UDP0
 	B0MOV A, UDR0_R
 	CMPRS A, #0xa5
 	B0BCLR usbStateEnterFlasher
-	CALL _uart_hex
-
 	INCMS UDP0
 	B0MOV A, UDR0_R
 	CMPRS A, #0x5a
 	B0BCLR usbStateEnterFlasher
-	CALL _uart_hex
 
-	MOV A, #0x20  ; ACK with no TX
-	B0MOV UE0R, A
-
-	; Enter flasher if flag is still set
+	; If flasher magic matched, enter flasher
 	B0BTS0 usbStateEnterFlasher
 	JMP _flasher
+
+	; Not flasher magic with 8 bytes - fall through to LED handling
+	; (paranoid: re-read byte 0 for LED state)
+	MOV A, #0
+	B0MOV UDP0, A
+	B0MOV A, UDR0_R
+	JMP _usb_set_report_store_led
+
+_usb_set_report_led:
+	; LED output report: 1 byte with 5 LED bits
+	MOV A, #0
+	B0MOV UDP0, A
+	B0MOV A, UDR0_R
+_usb_set_report_store_led:
+	B0MOV ledState, A
+	CALL _uart_hex
+	; Update CapsLock LED on P5.3/PWM0 (active low: clear=on, set=off)
+	; ledState bit 1 = CapsLock
+	B0BTS0 ledState.1
+	JMP _usb_set_report_led_on
+	; CapsLock off -> LED off (power LED stays off when CapsLock not active)
+	; Actually, keep power LED on and use it for CapsLock indication:
+	; LED off = set pin high (inactive)
+	B0BSET P5.3
+	JMP _usb_set_report_done
+_usb_set_report_led_on:
+	; CapsLock on -> LED on (set pin low = active)
+	B0BCLR P5.3
+_usb_set_report_done:
+	MOV A, #0x20  ; ACK with no TX
+	B0MOV UE0R, A
 	RET
 
 _usb_dth_hid_get_report:
 	MOV A, #'g'
 	CALL _uart_tx
-	; Send last 8 bytes in buffer
-	; FIXME: Handle this properly
-	MOV A, #0x28
+	; Check which interface is requesting (wIndex low byte)
+	B0MOV A, wIndexLo
+	B0BTS1 FZ
+	JMP _usb_get_report_mouse
+	; Interface 0: keyboard - send current keyboard state via EP0
+	; Copy EP1 buffer (offset 8) to EP0 buffer (offset 0)
+	MOV A, #8
+	B0MOV UDP0, A
+	B0MOV A, UDR0_R   ; modifiers
+	MOV A, #0
+	B0MOV UDP0, A
+	B0MOV UDR0_W, A    ; Write modifiers byte (re-read needed - just send 0 for now)
+	INCMS UDP0
+	MOV A, #0
+	B0MOV UDR0_W, A    ; reserved
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; key0
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; key1
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; key2
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; key3
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; key4
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; key5
+	MOV A, #0x28       ; ACK with 8 bytes TX
+	B0MOV UE0R, A
+	RET
+_usb_get_report_mouse:
+	; Interface 1: mouse - send empty report
+	MOV A, #0
+	B0MOV UDP0, A
+	B0MOV UDR0_W, A    ; buttons
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; x
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; y
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; wheel
+	INCMS UDP0
+	B0MOV UDR0_W, A    ; pan
+	MOV A, #0x25       ; ACK with 5 bytes TX
 	B0MOV UE0R, A
 	RET
 

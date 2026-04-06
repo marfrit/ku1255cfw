@@ -732,15 +732,17 @@ _mouse_write_ep2_suppress:
 	JMP _mouse_write_ep2_exit
 
 _mouse_write_ep2_fn_alt:
-	; FN held: left/right -> back/forward, TrackPoint -> scroll (stock FN behavior)
+	; FN held: behavior depends on middle button
+	; FN+middle = normal mouse passthrough (middle-drag, no scroll)
+	; FN without middle = left/right -> back/forward, TrackPoint -> scroll
+	B0BTS0 tpData1.2
+	JMP _mouse_write_ep2_normal  ; FN+middle -> plain middle-drag
+	; FN without middle: back/forward + scroll
 	MOV A, #0
 	B0BTS0 tpData1.0
 	OR  A, #8         ; Button4 (back)
 	B0BTS0 tpData1.1
 	OR  A, #16        ; Button5 (forward)
-	; FN+middle = pass middle click through (stock behavior)
-	B0BTS0 tpData1.2
-	OR  A, #4         ; Button3 (middle)
 	B0MOV UDR0_W, A
 	INCMS UDP0
 	MOV   A, #0       ; X-axis (suppressed)

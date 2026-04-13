@@ -150,6 +150,22 @@ keyState17     DS 1 ; 136-
 
 extraState0    DS 1
 
+; HID change-detection shadow (mirrors what was last shipped on EP1)
+lastEP1_0      DS 1   ; modifierState1
+lastEP1_1      DS 1   ; reserved (always 0)
+lastEP1_2      DS 1   ; bootKeys0
+lastEP1_3      DS 1   ; bootKeys1
+lastEP1_4      DS 1   ; bootKeys2
+lastEP1_5      DS 1   ; bootKeys3
+lastEP1_6      DS 1   ; bootKeys4
+lastEP1_7      DS 1   ; bootKeys5
+lastEP1_8      DS 1   ; extraState0 (consumer; only sent in report protocol)
+
+; HID protocol + idle state (HID 1.11 §7.2.4 / §7.2.5)
+hidProtocol    DS 1   ; 0 = boot, 1 = report (default per spec)
+hidIdleRate    DS 1   ; units of 4ms; 0 = infinite (only on change)
+hidIdleCounter DS 1   ; SOF-decremented; 0 = expired, force resend
+
 i2cTxData      DS 1
 i2cRxData      DS 1
 i2cBitCnt      DS 1
@@ -556,6 +572,23 @@ _usb_suspend:
 _usb_sof:
 	B0BCLR FSOF
 
+	; Tick the HID idle countdown if a non-infinite rate was set.
+	; When it reaches zero, _kbd_write_ep1 will force a resend even
+	; if the report bytes haven't changed.
+	B0MOV A, hidIdleRate
+	CMPRS A, #0
+	JMP _usb_sof_tick_idle
+	JMP _usb_sof_kbd
+_usb_sof_tick_idle:
+	B0MOV A, hidIdleCounter
+	CMPRS A, #0
+	JMP _usb_sof_dec_idle
+	JMP _usb_sof_kbd          ; counter already zero; awaiting resend
+_usb_sof_dec_idle:
+	DECMS hidIdleCounter      ; skip next if result is 0
+	JMP _usb_sof_kbd
+_usb_sof_kbd:
+
 	; Check for cross-talk from too many depressed keys
 	CALL _kbd_count_rows_low
 	; Read the columns
@@ -787,7 +820,85 @@ _mouse_write_ep2_exit:
 _kbd_write_ep1:
 	B0BTS0 FUE1M0 ; Skip if zero
 	RET
-	; FUE1M0 is zero (NAK)
+	; FUE1M0 is zero (NAK): previous IN ACK'd by host, may load next.
+
+	; ---- Change detection (HID 1.11 §7.2.4 / boot-mode correctness) ----
+	; Compare each of the 9 report bytes against the shadow of what we
+	; last shipped. If anything differs, jump to the changed-path.
+	B0MOV A, modifierState1
+	CMPRS A, lastEP1_0
+	JMP _kbd_ep1_changed
+	B0MOV A, lastEP1_1
+	CMPRS A, #0           ; reserved byte should always be 0 in shadow
+	JMP _kbd_ep1_changed
+	B0MOV A, bootKeys0
+	CMPRS A, lastEP1_2
+	JMP _kbd_ep1_changed
+	B0MOV A, bootKeys1
+	CMPRS A, lastEP1_3
+	JMP _kbd_ep1_changed
+	B0MOV A, bootKeys2
+	CMPRS A, lastEP1_4
+	JMP _kbd_ep1_changed
+	B0MOV A, bootKeys3
+	CMPRS A, lastEP1_5
+	JMP _kbd_ep1_changed
+	B0MOV A, bootKeys4
+	CMPRS A, lastEP1_6
+	JMP _kbd_ep1_changed
+	B0MOV A, bootKeys5
+	CMPRS A, lastEP1_7
+	JMP _kbd_ep1_changed
+	B0MOV A, extraState0
+	CMPRS A, lastEP1_8
+	JMP _kbd_ep1_changed
+
+	; All bytes match shadow. Honor SET_IDLE: if the host set a non-zero
+	; idle rate AND the SOF-driven counter has expired, force a resend;
+	; otherwise NAK silently this poll.
+	B0MOV A, hidIdleRate
+	CMPRS A, #0
+	JMP _kbd_ep1_check_idle_counter
+	RET                            ; rate=0 (infinite) -> only on change
+_kbd_ep1_check_idle_counter:
+	B0MOV A, hidIdleCounter
+	CMPRS A, #0
+	JMP _kbd_ep1_idle_alive
+	JMP _kbd_ep1_send              ; counter expired -> resend now
+_kbd_ep1_idle_alive:
+	RET                            ; counter still ticking -> NAK silently
+
+_kbd_ep1_changed:
+	; Copy current report into the shadow so we'll diff next round.
+	B0MOV A, modifierState1
+	B0MOV lastEP1_0, A
+	MOV A, #0
+	B0MOV lastEP1_1, A
+	B0MOV A, bootKeys0
+	B0MOV lastEP1_2, A
+	B0MOV A, bootKeys1
+	B0MOV lastEP1_3, A
+	B0MOV A, bootKeys2
+	B0MOV lastEP1_4, A
+	B0MOV A, bootKeys3
+	B0MOV lastEP1_5, A
+	B0MOV A, bootKeys4
+	B0MOV lastEP1_6, A
+	B0MOV A, bootKeys5
+	B0MOV lastEP1_7, A
+	B0MOV A, extraState0
+	B0MOV lastEP1_8, A
+	; Fall through to send.
+
+_kbd_ep1_send:
+	; (Re)load the idle countdown from rate (units of 4ms; we tick every
+	; 1ms, so we resend faster than spec — harmless for boot-mode hosts.)
+	B0MOV A, hidIdleRate
+	B0MOV hidIdleCounter, A
+
+	; Fill the EP1 buffer (offset 8) with the 9-byte composite report.
+	; In boot protocol the 9th byte (consumer/extraState) is silently
+	; dropped via UE1R_C=8 below; the byte still occupies buffer slack.
 	MOV A, #8   ; EP1 begins at offset 8
 	B0MOV UDP0, A
 
@@ -819,14 +930,19 @@ _kbd_write_ep1:
 	B0MOV UDR0_W, A
 	INCMS UDP0
 
-	MOV A, #9  ; EP1 count is 9
+	; Protocol-aware count: boot=8, report=9.
+	B0MOV A, hidProtocol
+	CMPRS A, #0
+	JMP _kbd_ep1_cnt_report   ; protocol != 0 -> report
+	MOV A, #8                 ; protocol == 0 -> boot
+	JMP _kbd_ep1_cnt_set
+_kbd_ep1_cnt_report:
+	MOV A, #9
+_kbd_ep1_cnt_set:
 	B0MOV UE1R_C, A
 
 	; Set EP1 to ACK
 	B0BSET FUE1M0
-
-	; MOV A, #','
-	; CALL _uart_tx
 	RET
 
 _usb_reset:
@@ -884,6 +1000,20 @@ _usb_init:
 	B0MOV usbState, A
 	B0MOV usbState2, A
 	B0MOV USTATUS, A
+	; Reset HID change-shadow + idle counter; default to report protocol
+	B0MOV lastEP1_0, A
+	B0MOV lastEP1_1, A
+	B0MOV lastEP1_2, A
+	B0MOV lastEP1_3, A
+	B0MOV lastEP1_4, A
+	B0MOV lastEP1_5, A
+	B0MOV lastEP1_6, A
+	B0MOV lastEP1_7, A
+	B0MOV lastEP1_8, A
+	B0MOV hidIdleRate, A     ; 0 = infinite (send only on change)
+	B0MOV hidIdleCounter, A
+	MOV A, #1
+	B0MOV hidProtocol, A     ; report protocol per HID spec default
 	MOV A, #32
 	B0MOV EP2FIFO_ADDR, A
 	MOV A, #0x80
@@ -2051,7 +2181,7 @@ _setup_dispatch_table:
 	DW 0x210a  ; HID SET_IDLE
 	JMP _usb_htd_hid_set_idle
 	DW 0x210b  ; HID SET_PROTOCOL
-	JMP _usb_setup_default
+	JMP _usb_htd_hid_set_protocol
 	DW 0x8000  ; GET_STATUS
 	JMP _usb_dth_get_status
 	DW 0x8006  ; GET_DESCRIPTOR (device)
@@ -2665,6 +2795,26 @@ _usb_htd_set_address:
 _usb_htd_hid_set_idle:
 	MOV A, #'I'
 	CALL _uart_tx
+	; HID 1.11 §7.2.4 — duration is wValueHi, in units of 4ms.
+	; 0 = infinite (only on change). Reset the SOF-driven counter so
+	; the next forced resend lands ~rate*4ms from now.
+	B0MOV A, wValueHi
+	B0MOV hidIdleRate, A
+	B0MOV hidIdleCounter, A
+	MOV A, #0x20  ; ACK with no TX
+	B0MOV UE0R, A
+	RET
+
+_usb_htd_hid_set_protocol:
+	MOV A, #'P'
+	CALL _uart_tx
+	; HID 1.11 §7.2.5 — wValueLo: 0 = boot, 1 = report.
+	B0MOV A, wValueLo
+	B0MOV hidProtocol, A
+	; Protocol just changed: invalidate shadow so next _kbd_write_ep1
+	; ships a fresh report under the new wire format.
+	MOV A, #0xff
+	B0MOV lastEP1_0, A
 	MOV A, #0x20  ; ACK with no TX
 	B0MOV UE0R, A
 	RET
